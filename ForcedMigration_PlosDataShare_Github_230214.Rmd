@@ -1,0 +1,1182 @@
+---
+title: "PlosOneDataShare"
+output: html_document
+date: '2022-08-23'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Setup
+```{r}
+library(pacman)
+pacman::p_load(foreign, data.table, WDI, eurostat, raster, ncdf4, # load data
+               dummies, dplyr, tidyr, readr, broom, tidyverse, zoo, tibbletime, # clean data
+               ggmap, geosphere, countrycode, maps, sf, rgeos, rworldmap, geonames, MASS, # geo data
+               ggplot2, ggrepel, viridis, janitor, jtools, LearnGeom, RColorBrewer, ggwordcloud, cowplot, # visualization
+               texreg, plm, Rmisc, # computing
+               imputeTS, fable, tsibble, tsibbledata, feasts, lubridate, # time series
+               stargazer, xtable # export results
+               )
+
+study.title = "PlosOneDataShare"
+
+```
+
+
+
+###############################################################
+## Prepare data
+
+  # Load Eurostat data using API
+```{r}
+######## Load Eurostat data
+# dat = get_eurostat("migr_asyappctza")
+# dat = data.frame(dat)
+# write.csv(dat, "migr_asyappctza.csv", row.names = F)
+
+######## Immigration flow
+flow = fread("migr_asyappctza.csv", 
+                header = T, colClasses = "character", na.strings = "")
+flow = subset(flow, sex == "T" & age == "TOTAL" & asyl_app == "NASY_APP")
+flow = filter(flow, geo != "EU27_2020" & geo != "EU28" & geo != "TOTAL")
+
+flow = flow %>%
+  dplyr::rename(Dest = geo,
+         nm = values,
+         Origin = citizen,
+         date = time)
+flow$nm = as.numeric(flow$nm)
+flow$Year = as.numeric(substr(flow$date, 1, 4))
+flow = subset(flow, select = -c(age, unit, date))
+
+# drop if Origin is EU
+EU.country = c(unique(flow$Dest))
+flow$non.eu.Origin = 1
+flow[is.element(flow$Origin, EU.country), "non.eu.Origin"] = 0
+flow = subset(flow, non.eu.Origin == 1)
+
+#drop if Origin = Dest
+nrow(flow[flow$Origin == flow$Dest, ])
+flow = flow[flow$Origin != flow$Dest, ]
+
+# only keep 2 digits country code not region code
+flow = subset(flow, nchar(Origin) == 2) 
+unique(flow$Origin)
+
+# convert country name to iso3
+flow = subset(flow, Origin != "XK")
+custom.match = c("AN" = "ANT",  "NA" = "NAM")
+
+flow = flow %>% 
+  mutate(iso3.Origin = 
+           countrycode(Origin, 
+                       origin = "eurostat", destination = "iso3c", 
+                       custom_match = custom.match))
+unique(flow$iso3.Origin)
+
+flow = flow %>% 
+  mutate(iso3.Dest = 
+           countrycode(Dest, 
+                       origin = "eurostat", destination = "iso3c", 
+                       custom_match = custom.match))
+unique(flow$iso3.Dest)
+
+flow = subset(flow, select = -c(Dest, Origin, non.eu.Origin)) 
+
+# Flow index
+flow$flow = paste(flow$iso3.Origin, flow$iso3.Dest, sep = "-")
+
+# Create id
+flow = flow %>% mutate(id = paste(flow, sep = ".")) 
+
+# sum id year
+flow = flow %>% dplyr::group_by(id, Year) %>% 
+  dplyr::summarise(nm = sum(nm, na.rm = T)) %>%
+  arrange(id, Year) 
+
+## check id year unique
+unique(table(flow$id, flow$Year))
+any(table(flow$id, flow$Year) > 1)
+flow = flow %>% distinct(id, Year, .keep_all = T)
+
+
+######## Expand period
+data = flow
+
+ma.period = 10 # Set years back in time
+
+minYear = min(data$Year)
+maxYear = max(data$Year)
+newYear = tibble(newYear = seq(minYear-ma.period, maxYear, 1) )
+
+temp = data %>% dplyr::select(id) %>% distinct()
+temp =  expand_grid(temp, newYear) %>%
+  dplyr::rename(Year = newYear)
+
+temp = left_join(temp, data, by = c("id", "Year"))
+
+data = temp
+
+# check if data are equal length
+data = data %>% arrange(id, Year) %>%
+    group_by(id) %>%
+    mutate(time = Year - min(Year)) %>%
+    mutate(max.time = max(time))
+summary(data[data$time == 1, "max.time"])
+data = data %>% dplyr::select(-c(time, max.time))
+  
+######## substr iso3
+data$iso3.Origin = substr(data$id, 1, 3)
+data$iso3.Dest = substr(data$id, 5, 7)
+
+```
+
+
+
+  # Gather WDI, SPEI, UPCD Data
+```{r}
+################ WDI gdp data
+# wdi = WDI(indicator="NY.GDP.PCAP.CD", country="all", start=1960, end=2019, extra = T)
+# 
+# # deal with Missing Syria GDP 2008- using growth rate  https://tradingeconomics.com/syria/gdp-growth-annual
+# year = seq(2007, 2019, 1)
+# gr = c(0, 0.045, 0.059, 0.034, 0.046, -0.26, -0.26, -0.147, -0.06, -0.04, -0.015, 0.027, 0.048)
+# gr = data.table(year, gr)
+# gr$iso3c = "SYR"
+# gr = left_join(gr, wdi, by = c("year", "iso3c"))
+# gr = gr %>% select(year, gr, iso3c, NY.GDP.PCAP.CD)
+# 
+# fibonacci <- function(x, y){
+#     for(i in seq(2, length(x))){
+#         x[i] <- x[i-1] * (1 + y[i])
+#     }
+#     x
+# }
+# 
+# gr = gr %>% mutate(new.gdp = fibonacci(x = NY.GDP.PCAP.CD, y = gr))
+# gr = gr %>%  dplyr::select(-NY.GDP.PCAP.CD, - gr)
+# 
+# wdi = left_join(wdi, gr)
+# wdi = wdi %>% mutate(NY.GDP.PCAP.CD = ifelse(is.na(NY.GDP.PCAP.CD), new.gdp, NY.GDP.PCAP.CD))
+# wdi = wdi %>% dplyr::select(-new.gdp)
+#   
+# write.csv(wdi, "WDI.current.usd.impute.csv", row.names = F)
+
+wdi = fread("WDI.current.usd.impute.csv",
+               header = T, colClasses = "character", na.strings = "")
+wdi = wdi %>% dplyr::rename(gdp = NY.GDP.PCAP.CD) 
+wdi$gdp = as.numeric(wdi$gdp)
+
+table(wdi[is.na(wdi$gdp), "iso3c"])
+wdi = wdi %>% arrange(iso3c, year) %>% group_by(iso3c) %>%
+  mutate(value.rows = ifelse(!is.na(gdp), 1, 0)) %>%
+    mutate(value.rows = sum(value.rows)) %>%
+  filter(value.rows > 10 ) %>%
+  mutate(gdp = ifelse(is.na(gdp), na_kalman(gdp), gdp) ) %>% 
+  dplyr::select(-value.rows)
+table(wdi[is.na(wdi$gdp), "iso3c"])
+
+wdi = wdi %>% mutate(gdp = ifelse(gdp < 0, 0, gdp))
+summary(wdi$gdp)
+
+wdi = subset(wdi, select = -c(country, iso2c, capital, lending, longitude, latitude))
+wdi = wdi %>% filter(year >= 1990)
+
+################ WDI pop data
+# pop = WDI(indicator="SP.POP.TOTL", 
+#                 country="all", start=1960, end=2019, extra = T)
+# write.csv(pop, "WDI.pop.csv", row.names = F)
+pop = fread("WDI.pop.csv",
+               header = T, colClasses = "character", na.strings = "") %>%
+  dplyr::rename(pop = SP.POP.TOTL) %>%
+  dplyr::select(iso3c, year, pop)
+pop = pop %>% filter(year >= 1990)
+pop$pop = as.numeric(pop$pop)
+
+table(pop[is.na(pop), .(iso3c)])
+pop = pop %>% arrange(iso3c, year) %>% group_by(iso3c) %>%
+  mutate(value.rows = ifelse(!is.na(pop), 1, 0)) %>%
+    mutate(value.rows = sum(value.rows)) %>%
+  filter(value.rows > 10 ) %>%
+  mutate(pop = ifelse(is.na(pop), na_kalman(pop), pop) ) %>% 
+  dplyr::select(-value.rows)
+table(pop[is.na(pop$pop), "iso3c"])
+
+wdi = left_join(wdi, pop)
+
+wdi = wdi  %>% mutate(year = as.numeric(year))
+  
+
+################ Uppsala conflict data
+ucdp = fread("ged201.csv")
+ucdp = ucdp %>% dplyr::select(year, country, best) %>%
+  dplyr::rename(ucdp.b.death = best)
+
+ucdp = ucdp %>% 
+  mutate(country = ifelse(country == "Yemen (North Yemen)", "Yemen", country)) %>% 
+  mutate(iso3c = countrycode(country, 
+                       origin = "country.name", destination = "iso3c")) %>%
+  dplyr::select(-country)
+
+ucdp = ucdp %>% group_by(year, iso3c) %>%
+  dplyr::summarise(ucdp.b.death = sum(ucdp.b.death, na.rm = T))
+
+#check id Year unique
+unique(table(ucdp$iso3c, ucdp$year))
+any(table(ucdp$iso3c, ucdp$year) != 1)
+ucdp = ucdp %>% distinct(iso3c, year, .keep_all = T)
+
+################ SPEI data
+# # Selec year
+# spei.df = fread("spei.df.csv") 
+# 
+# # format date and select year
+# spei.df = spei.df %>% mutate(date = as.Date(date)) %>% 
+#   mutate(month = format(date, "%m"), year = format(date, "%Y"))
+# spei.df = spei.df %>% dplyr::select(-date) %>% filter(year >= 2000)
+# 
+# write.csv(spei.df, "spei.df.1990.csv", row.names = F)
+
+# spei.df = fread("spei.df.1990.csv")
+# 
+# # spei.mean
+# spei.mean = spei.df %>% group_by(iso3c, year) %>%
+#   dplyr::summarise(spei = mean(spei, na.rm = T))
+# 
+# # spei.risk
+# spei.df = spei.df %>% 
+#   mutate(spei.cat = ifelse(spei < - 2, "Severe.Dry", 
+#                                   ifelse(spei > 2 , "Severe.Wet", "Normal")))
+# 
+# events = spei.df  %>% mutate(value = 1) %>%
+#   group_by(iso3c, year, spei.cat) %>% 
+#   dplyr::summarise(events = sum(value, na.rm = T))
+#   
+# grid.months = spei.df %>% dplyr::select(iso3c, year) %>%   
+#   mutate(grid.months = 1) %>%
+#   group_by(iso3c, year) %>% 
+#   dplyr::summarise(grid.months = sum(grid.months))
+# 
+# spei.risk = left_join(events, grid.months) %>% 
+#   mutate(spei.risk = events/grid.months) %>% 
+#   dplyr::select(-events, -grid.months) %>% 
+#   spread(., spei.cat, spei.risk)
+# 
+# spei.summary = inner_join(spei.mean, spei.risk)
+# 
+# write.csv(spei.summary, "spei.summary.csv", row.names = F)
+
+# load data
+spei.df = fread("spei.summary.csv")
+spei.df = spei.df %>% replace(is.na(.), 0)
+
+#check id Year unique
+unique(table(spei.df$iso3c, spei.df$year))
+any(table(spei.df$iso3c, spei.df$year) != 1)
+spei.df = spei.df %>% distinct(iso3c, year, .keep_all = T)
+
+
+```
+
+
+
+  # Combine data sources
+```{r}
+gdp.gr.df = wdi %>% 
+  filter(year >= 1990 & income != "Aggregates" & iso3c != "NCL") 
+
+gdp.gr.df = left_join(gdp.gr.df, ucdp, by = c("iso3c" = "iso3c", "year" = "year"))
+gdp.gr.df = left_join(gdp.gr.df, spei.df, by = c("iso3c" = "iso3c", "year" = "year"))
+
+#check id Year unique
+unique(table(gdp.gr.df$iso3c, gdp.gr.df$year))
+any(table(gdp.gr.df$iso3c, gdp.gr.df$year) != 1)
+gdp.gr.df = gdp.gr.df %>% distinct(iso3c, year, .keep_all = T)
+
+# log gdp and gdp.gr
+gdp.gr.df = gdp.gr.df %>% 
+  mutate(ln.gdp = log(gdp + 1)) %>%
+  group_by(iso3c) %>% 
+  dplyr::mutate(gdp.gr = ln.gdp - dplyr::lag(ln.gdp, n=1, default = NA, order_by = year) ) %>%
+  mutate(gdp.gr = ifelse(is.na(gdp.gr), 0, gdp.gr))
+
+# spei category
+gdp.gr.df = gdp.gr.df %>% group_by(iso3c) %>% 
+  dplyr::mutate(spei = ifelse(is.na(spei), dplyr::lag(spei, 1, order_by = year), spei),
+         Normal = ifelse(is.na(Normal), dplyr::lag(Normal, 1, order_by = year), Normal),
+         Severe.Dry = ifelse(is.na(Severe.Dry), dplyr::lag(Severe.Dry, 1, order_by = year), Severe.Dry),
+         Severe.Wet = ifelse(is.na(Severe.Wet), dplyr::lag(Severe.Wet, 1, order_by = year), Severe.Wet))
+
+gdp.gr.df = gdp.gr.df %>% filter(!is.na(spei))
+
+gdp.gr.df = gdp.gr.df %>% mutate(spei.wet = ifelse(spei > 0, spei, 0),
+                                 spei.dry = ifelse(spei < 0, -spei, 0))
+
+
+# Conver to tsibble
+gdp.gr.df = tsibble(gdp.gr.df, key = iso3c, index = year)
+
+###################################################################################
+# Create mig data
+mig.df = data %>% dplyr::rename(nm.flow = nm) 
+
+temp = gdp.gr.df %>% 
+  rename_with(~str_c(., ".Origin"), .cols = -c(year, iso3c))
+mig.df = left_join(mig.df, temp, by = c("iso3.Origin" = "iso3c", "Year" = "year")) 
+
+temp = gdp.gr.df %>% 
+  rename_with(~str_c(., ".Dest"), .cols = -c(year, iso3c))
+mig.df = left_join(mig.df, temp, by = c("iso3.Dest" = "iso3c", "Year" = "year")) 
+  
+mig.df = subset(mig.df, iso3.Origin!="MCO") 
+mig.df = subset(mig.df, iso3.Origin!="AND") 
+mig.df = subset(mig.df, iso3.Origin!="SMR") 
+mig.df = subset(mig.df, iso3.Origin!="NCL") 
+mig.df = subset(mig.df, iso3.Origin!="KHM") 
+mig.df = subset(mig.df, iso3.Origin!="PNG")
+# mig.df = subset(mig.df, iso3.Origin!="BFA") 
+# mig.df = subset(mig.df, iso3.Origin!="ARM") 
+mig.df = subset(mig.df, region.Origin!="North America") 
+
+# drop countries that have no gdp data
+unique(mig.df[is.na(mig.df$gdp.Origin), "iso3.Origin"])
+mig.df = subset(mig.df, !is.na(gdp.Origin))
+
+unique(mig.df[is.na(mig.df$gdp.Dest), "iso3.Dest"])
+mig.df = subset(mig.df, !is.na(gdp.Dest))
+
+  # select starting year
+  summary(mig.df$Year)
+  start.Year = 2008 # = 2008-01-01 see https://ec.europa.eu/eurostat/cache/metadata/en/migr_immi_esms.htm
+  lag.year = 5
+  mig.df = subset(mig.df, Year >= start.Year - lag.year)
+  
+mig.df = mig.df %>% 
+    mutate(value.row = ifelse(is.na(nm.flow), 0, 1)) %>%
+    group_by(id) %>% 
+    dplyr::mutate(value.row = sum(value.row))
+  cut = max(mig.df$value.row)-2 # select time series length 
+  mig.df = subset(mig.df, value.row >= cut) %>% 
+    dplyr::select(-value.row) 
+  unique(mig.df$iso3.Dest)
+
+  # select flows with at least one migrant
+ mig.df = mig.df %>% group_by(id) %>%
+    dplyr::mutate(tot.nm.flow = sum(nm.flow, na.rm = T) ) %>% 
+   filter(., tot.nm.flow>0)
+ 
+  # log vars
+  mig.df = mig.df %>% mutate(nm.flow = (nm.flow + 1),
+                             ln.nm.flow = log(nm.flow ),
+                             prob.nm.flow = (nm.flow )/pop.Origin,# * 100,
+                             ln.prob.nm.flow = log(prob.nm.flow) )
+  summary(mig.df$prob.nm.flow)
+
+  mig.df = mig.df %>% 
+      mutate(ln.Severe.Dry.Origin = log(Severe.Dry.Origin + .0001),
+             ln.Severe.Wet.Origin = log(Severe.Wet.Origin + .0001))
+    
+  mig.df = mig.df %>% 
+      mutate(ucdp.b.death.Origin = ifelse(is.na(ucdp.b.death.Origin), 0, ucdp.b.death.Origin)) %>%
+      mutate(prob.ucdp.b.death.Origin = (ucdp.b.death.Origin + 1)/pop.Origin,
+             ln.ucdp.b.death.Origin = log(prob.ucdp.b.death.Origin) )
+
+
+  # lag vars
+  mig.df = mig.df %>% group_by(id) %>%
+    dplyr::mutate(
+      L1.ln.prob.nm.flow= dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+      # gdp
+      L1.ln.gdp.Dest = dplyr::lag(ln.gdp.Dest, 1, order_by = Year),
+      L1.ln.gdp.Origin = dplyr::lag(ln.gdp.Origin, 1, order_by = Year),
+      L2.ln.gdp.Dest = dplyr::lag(ln.gdp.Dest, 2, order_by = Year),
+      L2.ln.gdp.Origin = dplyr::lag(ln.gdp.Origin, 2, order_by = Year),
+      L3.ln.gdp.Dest = dplyr::lag(ln.gdp.Dest, 3, order_by = Year),
+      L3.ln.gdp.Origin = dplyr::lag(ln.gdp.Origin, 3, order_by = Year),
+      # ucdp
+      L1.ln.ucdp.b.death.Origin = dplyr::lag(ln.ucdp.b.death.Origin, 1, order_by = Year),
+      L2.ln.ucdp.b.death.Origin = dplyr::lag(ln.ucdp.b.death.Origin, 2, order_by = Year),
+      L3.ln.ucdp.b.death.Origin = dplyr::lag(ln.ucdp.b.death.Origin, 3, order_by = Year),
+      # spei
+      L1.ln.Severe.Dry.Origin = dplyr::lag(ln.Severe.Dry.Origin, 1, order_by = Year),
+      L1.ln.Severe.Wet.Origin = dplyr::lag(ln.Severe.Wet.Origin, 1, order_by = Year),
+      L2.ln.Severe.Dry.Origin = dplyr::lag(ln.Severe.Dry.Origin, 2, order_by = Year),
+      L2.ln.Severe.Wet.Origin = dplyr::lag(ln.Severe.Wet.Origin, 2, order_by = Year),
+      L3.ln.Severe.Dry.Origin = dplyr::lag(ln.Severe.Dry.Origin, 3, order_by = Year),
+      L3.ln.Severe.Wet.Origin = dplyr::lag(ln.Severe.Wet.Origin, 3, order_by = Year)
+      )
+  
+# check if data are equal length
+mig.df = mig.df %>% arrange(id, Year) %>%
+    group_by(id) %>%
+    mutate(time = Year - min(Year)) %>%
+    mutate(max.time = max(time)) 
+summary(mig.df[mig.df$time == 1, "max.time"])
+mig.df = mig.df %>% 
+  dplyr::select(-c(time, max.time))
+
+# check any na
+mig.df = mig.df %>% filter(Year >= start.Year)
+any(is.na(mig.df))
+
+# Select ucdp rows not na > cut
+mig.df = mig.df %>% 
+    mutate(value.row = ifelse(ucdp.b.death.Origin > 1, 1, 0)) %>% 
+    group_by(id) %>% 
+    dplyr::mutate(value.row = sum(value.row))
+  quantile(mig.df[mig.df$Year == start.Year, "value.row"], seq(0,1,0.1), na.rm = T)
+  cut = 2 # specify sample selection 
+  mig.df = subset(mig.df, value.row >= cut) %>% 
+    dplyr::select(-value.row)
+  
+# Conver to tsibble
+mig.df = tsibble(mig.df, key = id, index = Year)
+
+unique(mig.df$iso3.Origin)
+unique(mig.df$iso3.Dest)
+unique(mig.df$Year)
+
+```
+
+
+
+  # Outcome Descrpitives
+```{r}
+pacman::p_load(scales)
+pacman::p_load(geomtextpath)
+
+# plot largest origin only
+top.origin = as_tibble(mig.df) %>% group_by(iso3.Origin) %>% # select top flows
+  dplyr::mutate(avg.obs = max(prob.nm.flow, na.rm = T)) %>%
+  mutate(quan.obs = quantile(avg.obs, prob = 0.88, na.rm = T),
+                top = ifelse(avg.obs > quan.obs, 1, 0)) %>%
+  dplyr::select(iso3.Origin, top) %>% distinct()
+
+# create coef.vis.df
+temp = as_tibble(mig.df) %>% 
+  dplyr::select(id, Year, nm.flow, prob.nm.flow, pop.Origin, pop.Dest, iso3.Origin, iso3.Dest, region.Origin, income.Origin)  
+coef.vis.df = temp
+
+#####################   By Flow Year
+plot.dt = coef.vis.df  %>% group_by(id) %>%
+  dplyr::mutate(avg.obs = mean(prob.nm.flow, na.rm = T))
+
+plot.dt = plot.dt %>%
+  mutate(quan.obs = quantile(avg.obs, prob = 0.99, na.rm = T),
+                top = ifelse(avg.obs > quan.obs, 1, 0)) %>%
+  gather(., key, value, c(prob.nm.flow)) %>%
+  group_by(key, id) %>%
+  dplyr::mutate(max.value = max(value, na.rm = T))
+
+p1 = plot.dt %>%
+  ggplot(aes(x = Year, y = value * 100, group = id)) +
+  geom_line(data = plot.dt %>% filter(top != 1),
+            alpha = 0.4, color = "grey", size = 0.2) +
+  geom_line(data = plot.dt %>% filter(top == 1),
+            aes(color = iso3.Origin, linetype = iso3.Dest),
+            alpha = 0.8, size = 0.5,
+            show.legend = F) +
+  geom_point(data = plot.dt %>% filter(top == 1),
+            aes(color = iso3.Origin),
+            alpha = 0.8, size = 0.8,
+            show.legend = F) +
+  geom_textline(data = plot.dt %>% filter(top == 1 & value == max.value),
+             aes(color = iso3.Origin, label = id),
+             size = 3.8,
+             show.legend = F) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 12),
+        axis.title.y =
+          element_text(margin = margin(t = 0, r = 10, b = 0, l = 0))
+        )  +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Asyl. Seek. Rate (per 100 Origin Pop.)")
+
+
+#####################   By Origin Year
+plot.dt = coef.vis.df  %>% 
+  group_by(iso3.Origin, Year) %>% 
+  dplyr::summarise(value = sum(prob.nm.flow, na.rm = T))
+  
+plot.dt = plot.dt %>%  
+  left_join(., top.origin) %>%
+  group_by(iso3.Origin) %>%
+  dplyr::mutate(max.value = max(value, na.rm = T))
+
+p2 = plot.dt %>%
+  ggplot(aes(x = Year, y = value * 100, group = iso3.Origin)) +
+  geom_line(data = plot.dt %>% filter(top != 1),
+            alpha = 0.4, color = "grey", size = 0.2) +
+  geom_line(data = plot.dt %>% filter(top == 1), 
+            aes(color = iso3.Origin, linetype = iso3.Origin),
+            alpha = 0.8, size = 0.5, 
+            show.legend = F) +
+  geom_point(data = plot.dt %>% filter(top == 1), 
+            aes(color = iso3.Origin),
+            alpha = 0.8, size = 0.8,
+            show.legend = F) +
+  geom_textline( data = plot.dt %>% filter(top == 1 & value == max.value), 
+             aes(color = iso3.Origin, label = iso3.Origin),
+             size = 3.8,
+             show.legend = F) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 12),
+        axis.title.y = 
+          element_text(margin = margin(t = 0, r = 10, b = 0, l = 0))
+        )  +
+  scale_fill_brewer(palette = "Dark2")+
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Asyl. Seek. Rate (per 100 Origin Pop.)")
+
+# combine plot
+plot_grid(p1 + theme(axis.text.x = element_blank(), axis.title.x = element_blank()), 
+          p2, 
+          labels = c('A', 'B'), label_size = 15, ncol = 1)
+ggsave(paste(study.title, "migRate.FlowPlusOrigin", ".jpeg", sep = "_"), width = 8, height = 8)
+
+
+```
+
+
+
+  # Covariates Descrpitives
+```{r}
+
+####################  GDP 
+plot.df = as_tibble(mig.df) %>% 
+  dplyr::select(id, Year, prob.nm.flow, iso3.Origin,
+                                       gdp.Origin) %>% 
+  group_by(iso3.Origin, Year) %>%
+  dplyr::summarise_at(vars("gdp.Origin"), mean, na.rm = T) %>%
+  left_join(top.origin)
+
+p.gdp = plot.df %>%
+  ggplot(aes(x = Year, y = gdp.Origin, group = iso3.Origin)) +
+    # geom_line(data = plot.df %>% filter(top != 1),
+    #         alpha = .6, color = "grey", size = 0.2) +
+  geom_line(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin, linetype = iso3.Origin),
+            alpha = 0.6, size = 1, 
+            show.legend = T) +
+  geom_point(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin, shape = iso3.Origin),
+            alpha = 1, size = 2.8,
+            show.legend = T) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 14),
+        axis.title.y = 
+          element_text(margin = margin(t = 0, r = 20, b = 0, l = 0))
+        ) +
+  scale_fill_brewer(palette = "Dark2")+
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Origin GDP Per Capita")
+
+
+#################### Conflict
+plot.df = as_tibble(mig.df) %>% 
+  dplyr::select(id, Year, prob.nm.flow, iso3.Origin,
+                prob.ucdp.b.death.Origin) %>% 
+  group_by(iso3.Origin, Year) %>%
+  dplyr::summarise_at(vars("prob.nm.flow", "prob.ucdp.b.death.Origin"), mean, na.rm = T) %>%
+  left_join(top.origin)
+
+p.conflict = plot.df %>%
+  ggplot(aes(x = Year, y = prob.ucdp.b.death.Origin, group = iso3.Origin)) +
+    # geom_line(data = plot.df %>% filter(top != 1),
+    #         alpha = .6, color = "grey", size = 0.2) +
+  geom_line(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin, linetype = iso3.Origin),
+            alpha = 0.6, size = 1, 
+            show.legend = T) +
+  geom_point(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin, shape = iso3.Origin),
+            alpha = 1, size = 2.8,
+            show.legend = T) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 14),
+        axis.title.y = 
+          element_text(margin = margin(t = 0, r = 20, b = 0, l = 0))
+        )  +
+  scale_fill_brewer(palette = "Dark2")+
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Conflict-Induced Fatality Rate")
+
+#################### SPEI
+plot.df = as_tibble(mig.df) %>% 
+  dplyr::select(id, Year, prob.nm.flow, iso3.Origin,
+         Severe.Wet.Origin, Severe.Dry.Origin) %>% 
+  group_by(iso3.Origin, Year) %>%
+  dplyr::summarise(prob.nm.flow = mean(prob.nm.flow, na.rm = T),
+                   Wet.Origin = mean(Severe.Wet.Origin, na.rm = T),
+                   Dry.Origin = mean(Severe.Dry.Origin, na.rm = T)) %>%
+  left_join(top.origin)
+
+plot.df = plot.df %>% gather(key, value, Wet.Origin, Dry.Origin)
+
+p.spei = plot.df %>%
+  ggplot(aes(x = Year, y = value, group = iso3.Origin)) +
+    # geom_line(data = plot.df %>% filter(top != 1),
+    #         alpha = .6, color = "grey", size = 0.2) +
+  geom_line(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin),
+            alpha = 0.6, size = .8, linetype = "dashed", 
+            show.legend = T) +
+  geom_point(data = plot.df %>% filter(top == 1), 
+            aes(color = iso3.Origin, shape = iso3.Origin),
+            alpha = 1, size = 2.8,
+            show.legend = T) +
+  facet_wrap(. ~ key, nrow = 1) +
+  theme_minimal() +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 14),
+        axis.title.y = 
+          element_text(margin = margin(t = 0, r = 20, b = 0, l = 0))
+        )  +
+  scale_fill_brewer(palette = "Dark2")+
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Risks of Extreme Weather")
+
+# combine plot
+plot = plot_grid(p.conflict +
+                   theme(legend.position = "none", axis.title.x = element_blank()),
+                 p.gdp +
+                   theme(legend.position = "none", axis.title.x = element_blank()),
+          labels = c('A', 'B'),
+          label_size = 15, ncol = 2)
+plot_grid(plot, p.spei, labels = c(" ", "C"), label_size = 15, ncol = 1,
+                 rel_heights = c(1,1))
+ggsave(paste(study.title, "covariates", ".jpeg", sep = "_"), width = 10, height = 10)
+
+
+
+
+```
+
+
+
+###############################################################
+## cross validation
+  # data split
+```{r}
+pacman::p_load(caret)
+
+# select random sample when testing
+frac <- 1
+temp = as_tibble(mig.df) %>% dplyr::select(iso3.Origin) %>% distinct() %>%
+  sample_frac(., frac, replace=F)
+top.origin = as_tibble(mig.df) %>% group_by(iso3.Origin) %>% # select top flows
+  dplyr::mutate(top = ifelse(iso3.Origin %in% temp$`iso3.Origin`, 1, 0)) %>%
+  dplyr::select(iso3.Origin, top) %>% distinct()
+
+# largest flows for estimation
+est.df <- mig.df %>% left_join(., top.origin) %>%
+  filter(top == 1)
+
+est.df  = est.df %>% 
+  dplyr::rename(est.gdp.Dest = ln.gdp.Dest,
+                est.gdp.Origin = L1.ln.gdp.Origin,
+                est.ucdp.b.death.Origin = L1.ln.ucdp.b.death.Origin,
+                est.Severe.Dry.Origin = L1.ln.Severe.Dry.Origin,
+                est.Severe.Wet.Origin = L1.ln.Severe.Wet.Origin) %>% 
+  dplyr::select(ln.prob.nm.flow, 
+                id, Year, iso3.Origin, iso3.Dest,
+                est.gdp.Dest, est.gdp.Origin,
+                est.ucdp.b.death.Origin, 
+                est.Severe.Dry.Origin,
+                est.Severe.Wet.Origin)
+
+spl.year <- est.df[,"Year"] %>% distinct()
+# control data split
+initialWindow <- nrow(spl.year)-3
+spl.index <- createTimeSlices(1:nrow(spl.year), 
+                              initialWindow = initialWindow, horizon = 1,
+                              fixedWindow = F)
+
+# Training data
+train.df <- c()
+for (i in 1:length(spl.index$train)) {
+  temp <- spl.year[spl.index$train[[i]], ] %>% left_join(., est.df) 
+  temp$spl.id <- i
+  train.df <- bind_rows(train.df, temp)
+}
+# Test data
+test.df <- c()
+for (i in 1:length(spl.index$test)) {
+  temp <- spl.year[spl.index$test[[i]], ] %>% left_join(., est.df) 
+  temp$spl.id <- i
+  test.df <- bind_rows(test.df, temp)
+}
+
+
+# plot data split
+plot <- bind_rows(train.df %>% dplyr::select(., Year, spl.id) %>% 
+                    distinct() %>% mutate(Data="Training"),
+                  test.df %>% dplyr::select(., Year, spl.id) %>% 
+                    distinct() %>% mutate(Data="Test")) %>% 
+  mutate(spl.id=factor(spl.id), Year=factor(Year), cell=1)
+ggplot(plot, aes(x=spl.id, y=Year)) +
+  geom_tile(aes(fill=Data), color="white") +
+    scale_color_viridis_d() +
+    scale_fill_viridis_d() +
+  theme_bw() +
+  theme(legend.title = element_blank()) +
+  coord_flip() +
+  xlab("Resample ID")
+ggsave(paste(study.title, "dataSplit.jpeg"), width = 6, height = 3)
+
+```
+
+
+  # Fixed effects no cov
+```{r}
+# Estimate model
+pdata <- pdata.frame(train.df, index = c("id", "Year", "spl.id"))
+
+train.fit <-
+  plm(ln.prob.nm.flow ~ id,
+      model = "pooling", data=pdata, index = c("id", "Year", "spl.id"))
+
+# export estimation results
+saveRDS(train.fit, paste(study.title, ".train.FE.simple", ".rds"))
+
+
+```
+
+
+  # Fixed effects
+```{r}
+# Estimate model
+pdata <- pdata.frame(train.df, index = c("id", "Year", "spl.id"))
+
+train.fit <-
+  plm(ln.prob.nm.flow ~ ##### gdp
+                        est.gdp.Dest + est.gdp.Origin +
+                        ##### ucdp
+                        est.ucdp.b.death.Origin +
+                        ##### spei
+                        est.Severe.Dry.Origin + est.Severe.Wet.Origin ,
+      model = "within", data=pdata, index = c("id", "Year", "spl.id"))
+
+
+# export estimation results
+saveRDS(train.fit, paste(study.title, ".train.FE", ".rds"))
+
+
+```
+
+
+  # Fable Estimation simple no arma
+```{r}
+# Estimate models
+fab.train.df <- tsibble(train.df, key = c(id, spl.id), index = Year)
+
+library(future)
+plan(multisession)
+
+train.fit <- fab.train.df %>% 
+  model(arima = ARIMA(ln.prob.nm.flow ~ 0 +
+                        ##### gdp
+                        est.gdp.Dest + est.gdp.Origin +           
+                        ##### ucdp
+                        est.ucdp.b.death.Origin +
+                        ##### spei
+                        est.Severe.Dry.Origin + est.Severe.Wet.Origin +
+                        pdq(p=0, d=1, q=0),
+                      stepwise = TRUE,
+                      greedy = TRUE
+                      )
+        )
+
+# export estimation results
+saveRDS(train.fit, paste(study.title, ".train.fable.noARMA", ".rds"))
+
+```
+
+
+  # Fable Estimation FTG arma
+```{r}
+# Estimate models
+fab.train.df <- tsibble(train.df, key = c(id, spl.id), index = Year)
+
+library(future)
+plan(multisession)
+
+train.fit <- fab.train.df %>% 
+  model(arima = ARIMA(ln.prob.nm.flow ~ 0 +
+                        ##### gdp
+                        est.gdp.Dest + est.gdp.Origin +           
+                        ##### ucdp
+                        est.ucdp.b.death.Origin +
+                        ##### spei
+                        est.Severe.Dry.Origin + est.Severe.Wet.Origin +
+                        pdq(d=1, q=0), #
+                      stepwise = TRUE,
+                      greedy = TRUE
+                      )
+        )
+
+# export estimation results
+saveRDS(train.fit, paste(study.title, ".train.fable", ".rds"))
+
+```
+
+
+
+###############################################################
+## Results
+  # Par Estimate: Points + Interval
+```{r}
+
+temp <- tidy(readRDS(paste(study.title, ".train.FE", ".rds"))) %>% 
+  mutate(Mod="FE") %>% 
+  dplyr::select(term, estimate, Mod)
+plot <- temp
+
+temp <- tidy(readRDS(paste(study.title, ".train.fable.noARMA", ".rds"))) %>% 
+  mutate(Mod="FTG") %>% 
+  dplyr::select(term, estimate, Mod)
+plot <- bind_rows(plot, temp) 
+
+temp <- tidy(readRDS(paste(study.title, ".train.fable", ".rds"))) %>% 
+  mutate(Mod="FTG.AR") %>% 
+  dplyr::select(term, estimate, Mod)
+plot <- bind_rows(plot, temp) 
+
+plot <- plot %>% 
+    mutate(label = 
+           ifelse(grepl("gdp.Dest", term), "Econ \n Dest", 
+                  ifelse(grepl("gdp.Origin", term), "Econ \n Orig", 
+                                       ifelse(grepl("Dry", term), "Clim \n Dry", 
+                                              ifelse(grepl("Wet", term), "Clim \n Wet", 
+                                                     ifelse(grepl("death", term), "Conflict", term)))))
+         )
+
+
+temp <- tidy(readRDS(paste(study.title, ".train.FE", ".rds"))) %>% 
+  mutate(up=estimate+1.96*std.error,
+         lo=estimate-1.96*std.error,
+         Mod="FE") %>% 
+  dplyr::select(term, estimate, up, lo, Mod)
+interval <- temp
+
+temp <- tidy(readRDS(paste(study.title, ".train.fable.noARMA", ".rds"))) %>% 
+  group_by(term) %>% 
+  dplyr::summarise(up=quantile(estimate, prob=0.975),
+                   lo=quantile(estimate, prob=0.025),
+                   estimate=mean(estimate))%>% 
+  mutate(Mod="FTG") %>% 
+  dplyr::select(term, estimate, up, lo, Mod)
+interval <- bind_rows(interval, temp) 
+
+temp <- tidy(readRDS(paste(study.title, ".train.fable", ".rds"))) %>% 
+  group_by(term) %>% 
+  dplyr::summarise(up=quantile(estimate, prob=0.975),
+                   lo=quantile(estimate, prob=0.025),
+                   estimate=mean(estimate))%>% 
+  mutate(Mod="FTG.AR") %>% 
+  dplyr::select(term, estimate, up, lo, Mod)
+interval <- bind_rows(interval, temp) 
+
+interval <- interval %>% 
+    mutate(label = 
+           ifelse(grepl("gdp.Dest", term), "Econ \n Dest", 
+                  ifelse(grepl("gdp.Origin", term), "Econ \n Orig", 
+                                       ifelse(grepl("Dry", term), "Clim \n Dry", 
+                                              ifelse(grepl("Wet", term), "Clim \n Wet", 
+                                                     ifelse(grepl("death", term), "Conflict", term)))))
+         )
+
+
+pacman::p_load(ggbeeswarm)
+
+ggplot(data=filter(plot, !grepl("ar", label) & !grepl("ma", label) &
+                     estimate>-15 & estimate<15),
+       aes(x=label, y=estimate,
+                    color=estimate, fill=estimate)) +
+  facet_wrap(.~Mod, scales = "free_x", nrow=1) +
+  geom_quasirandom(size=.2, alpha=0.8, shape=1) +
+  scale_color_viridis_c() +
+    scale_fill_viridis_c() +
+  geom_errorbar(data=filter(interval, !grepl("ar", label) & !grepl("ma", label) &
+                     estimate>-100),
+                aes(ymin=lo, ymax=up),
+                width=.1, linetype="solid", color="black") +
+  geom_point(data=filter(interval, !grepl("ar", label) & !grepl("ma", label) &
+                     estimate>-100), color="black") +
+  geom_hline(yintercept = 0, linetype="solid", color="grey60") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 0)) +
+  xlab("") + ylab("Coefficient Estimates") +
+  coord_flip()
+ggsave(paste(study.title, "coefEst.jpeg"), width = 6, height = 3.8)
+
+
+
+```
+
+
+
+  # Model comparison
+```{r}
+##### FE prediction on test data
+  # load model
+trained.model <- readRDS(paste(study.title, ".train.FE.simple", ".rds"))
+
+  # convert to pdata.frame
+p.test.df <- pdata.frame(test.df, index = c("id", "Year", "spl.id"))
+p.train.df <- pdata.frame(train.df, index = c("id", "Year", "spl.id"))
+
+  # predict
+    # test data
+test.pred <- predict(trained.model, newdata=p.test.df, na.fill=T) %>% as.data.frame()
+test.pred <- data.frame(index=row.names(test.pred), .sim=test.pred[,1]) %>% as.tibble() %>% 
+  separate(., index, sep="-", into = c("spl.id", "iso3.Origin", "iso3.Dest", "Year"),
+           convert = T)
+test.pred <- left_join(test.pred, test.df) %>% mutate(.sim=as.numeric(.sim)) %>% 
+  ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+    # training data
+train.pred <- predict(trained.model, newdata=p.train.df, na.fill=T) %>% as.data.frame()
+train.pred <- data.frame(index=row.names(train.pred), .sim=train.pred[,1]) %>% as.tibble() %>% 
+  separate(., index, sep="-", into = c("spl.id", "iso3.Origin", "iso3.Dest", "Year"),
+           convert = T)
+train.pred <- left_join(train.pred, train.df) %>% mutate(.sim=as.numeric(.sim)) %>% 
+  ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+
+  # save prediction
+FE.Simple.test.pred <-  test.pred %>% mutate(Mod="FE.Simple") %>% as.tibble()
+FE.Simple.train.pred<-  train.pred %>% mutate(Mod="FE.Simple") %>% as.tibble() 
+
+
+##### FE prediction on test data
+  # load model
+trained.model <- readRDS(paste(study.title, ".train.FE", ".rds"))
+
+  # convert to pdata.frame
+p.test.df <- pdata.frame(test.df, index = c("id", "Year", "spl.id"))
+p.train.df <- pdata.frame(train.df, index = c("id", "Year", "spl.id"))
+
+  # predict
+    # test data
+test.pred <- predict(trained.model, newdata=p.test.df, na.fill=T) %>% as.data.frame()
+test.pred <- data.frame(index=row.names(test.pred), .sim=test.pred[,1]) %>% as.tibble() %>% 
+  separate(., index, sep="-", into = c("spl.id", "iso3.Origin", "iso3.Dest", "Year"),
+           convert = T)
+test.pred <- left_join(test.pred, test.df) %>% mutate(.sim=as.numeric(.sim)) %>% 
+  ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+    # training data
+train.pred <- predict(trained.model, newdata=p.train.df, na.fill=T) %>% as.data.frame()
+train.pred <- data.frame(index=row.names(train.pred), .sim=train.pred[,1]) %>% as.tibble() %>% 
+  separate(., index, sep="-", into = c("spl.id", "iso3.Origin", "iso3.Dest", "Year"),
+           convert = T)
+train.pred <- left_join(train.pred, train.df) %>% mutate(.sim=as.numeric(.sim)) %>% 
+  ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+
+  # save prediction
+FE.test.pred <-  test.pred %>% mutate(Mod="FE") %>% as.tibble()
+FE.train.pred<-  train.pred %>% mutate(Mod="FE") %>% as.tibble() 
+
+
+##########  Fabel prediction NO ARMA ########## 
+  # load model
+trained.model <- readRDS(paste(study.title, ".train.fable.noARMA", ".rds"))
+
+  # Conver to tsibble
+fab.test.df <- tsibble(test.df, key = c(id, spl.id), index = Year)
+fab.train.df<- tsibble(train.df, key = c(id, spl.id), index = Year)
+
+  # predict
+    # test data
+temp <- forecast(trained.model, new_data = fab.test.df) %>% dplyr::rename(.sim=.mean)
+test.pred <- temp %>% dplyr::select(c("id", "Year", "spl.id", ".sim"))
+test.pred <- left_join(test.pred, test.df) %>% ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+    # training data
+temp <- augment(trained.model, new_data = fab.train.df) 
+temp <- temp %>% mutate(.sim=ln.prob.nm.flow - .innov)
+train.pred <- temp %>% dplyr::select(c("id", "Year", "spl.id", ".sim"))
+train.pred <- left_join(train.pred, train.df) %>% ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+
+  # save prediction
+TS.test.pred<-  test.pred %>% mutate(Mod="FTG") %>% as.tibble() 
+TS.train.pred<-  train.pred %>% mutate(Mod="FTG") %>% as.tibble() 
+
+
+##########  Fabel prediction with ARMA ##########  
+  # load model
+trained.model <- readRDS(paste(study.title, ".train.fable", ".rds"))
+
+  # Conver to tsibble
+fab.test.df <- tsibble(test.df, key = c(id, spl.id), index = Year)
+fab.train.df<- tsibble(train.df, key = c(id, spl.id), index = Year)
+
+  # predict
+    # test data
+temp <- forecast(trained.model, new_data = fab.test.df) %>% dplyr::rename(.sim=.mean)
+test.pred <- temp %>% dplyr::select(c("id", "Year", "spl.id", ".sim"))
+test.pred <- left_join(test.pred, test.df) %>% ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+    # training data
+temp <- augment(trained.model, new_data = fab.train.df) 
+temp <- temp %>% mutate(.sim=ln.prob.nm.flow - .innov)
+train.pred <- temp %>% dplyr::select(c("id", "Year", "spl.id", ".sim"))
+train.pred <- left_join(train.pred, train.df) %>% ungroup() %>% group_by(id, spl.id) %>% 
+  dplyr::mutate(d.out=ln.prob.nm.flow-dplyr::lag(ln.prob.nm.flow, 1, order_by = Year),
+                d.sim=.sim-dplyr::lag(.sim, 1, order_by = Year)) %>% ungroup()
+
+
+  # save prediction
+TS.AR.test.pred<-  test.pred %>% mutate(Mod="FTG.AR") %>% as.tibble() 
+TS.AR.train.pred<-  train.pred %>% mutate(Mod="FTG.AR") %>% as.tibble() 
+
+
+
+
+##### Combine models predictions and compare
+all.train.pred <- bind_rows(FE.Simple.train.pred, FE.train.pred, 
+                            TS.train.pred, TS.AR.train.pred) 
+all.test.pred <- bind_rows(FE.Simple.test.pred, FE.test.pred,
+                           TS.test.pred, TS.AR.test.pred) 
+
+
+```
+
+
+
+  # Log flow by folds
+```{r}
+### label train.period
+train.period <- all.train.pred %>% dplyr::select(spl.id, Year) %>% distinct() %>% 
+  group_by(spl.id) %>% 
+  dplyr::summarise(minYear=min(Year), maxYear=max(Year)) %>% 
+  mutate(Training.Data.Period=paste(minYear, maxYear, sep="\n ~"))
+
+
+### scatter plot prediction
+plot <- bind_rows(all.train.pred %>% mutate(Set="Train"),
+                  all.test.pred %>% mutate(Set="Test")) %>% 
+  left_join(., train.period)
+
+  # RMSE
+text.rsq <- plot %>% group_by(Mod, Set) %>% 
+  dplyr::summarise(f.stat = sqrt(mean((ln.prob.nm.flow-.sim)^2, na.rm = T))) %>%
+  dplyr::select(Mod, Set, f.stat)
+temp <- plot %>% 
+  dplyr::summarise(text.x=min(.sim, na.rm = T), 
+                   text.y=max(ln.prob.nm.flow, na.rm = T))
+text.rsq <- expand_grid(text.rsq, temp)
+
+  # plot
+ggplot(plot, aes(x=.sim, y=ln.prob.nm.flow))+
+  geom_point(aes(color=Training.Data.Period), alpha=0.8, shape=1) +
+    scale_color_viridis_d() +
+    scale_fill_viridis_d() +
+  geom_abline(slope = 1, intercept = 0) +
+  facet_grid(factor(Mod, levels = c("FE.Simple", "FE", "FTG", "FTG.AR")) ~
+               factor(Set, levels = c("Train", "Test"))
+             ) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  ylab("Obs. log(Asylum Seeking Rate)") + xlab("Pred. log(Asylum Seeking Rate)") +
+  geom_text(data=text.rsq, 
+            aes(x=text.x*.6, y=text.y*1.2, 
+                               label=paste("RMSE =", round(f.stat, 3))))
+ggsave(paste(study.title, "scatter.jpeg"), height=6.8, width=5)
+
+### rmse
+temp <- all.train.pred %>% group_by(Mod, spl.id) %>%
+  dplyr::summarise(RMSE = sqrt(mean((ln.prob.nm.flow-.sim)^2, na.rm = T)), 
+                   Set="Train")
+plot <- temp
+
+temp <- all.test.pred %>% group_by(Mod, spl.id) %>%
+  dplyr::summarise(RMSE = sqrt(mean((ln.prob.nm.flow-.sim)^2, na.rm = T)), 
+                   Set="Test")
+plot <- bind_rows(plot, temp)
+
+plot <- left_join(plot, train.period)
+plot <- plot %>% mutate(grp=paste(Mod, Set, sep="."))
+  
+pacman::p_load(geomtextpath)
+plot$Mod <- factor(plot$Mod, levels = c("FE.Simple", "FE", "FTG", "FTG.AR"))
+hl <- filter(plot, Set=="Test" & Mod=="FTG")
+hl <- min(hl$RMSE)
+
+ggplot(plot, aes(Training.Data.Period, RMSE,  group=grp)) +
+  facet_grid(.~Mod) +
+  geom_point(size=-1)+
+  geom_textline(aes(label=Set, color=Mod), 
+                 show.legend = F, size=5) +
+    scale_color_viridis_d() +
+    scale_fill_viridis_d() +
+  geom_hline(yintercept = hl, linetype="dashed", color="grey") +
+  theme_bw()
+ggsave(paste(study.title, "err_fold.jpeg"), height=5, width=8)
+ 
+
+```
+
+
+
+  # Predicted Trends
+```{r}
+# select top decile origin
+#####################   By Flow Year
+
+temp <- as_tibble(mig.df) %>% 
+  dplyr::select(id, Year, nm.flow, prob.nm.flow, pop.Origin, pop.Dest, iso3.Origin, iso3.Dest, region.Origin, income.Origin) 
+
+temp = temp  %>% group_by(id) %>%
+  dplyr::mutate(avg.obs = mean(prob.nm.flow, na.rm = T))
+
+temp = temp %>%
+  mutate(quan.obs = quantile(avg.obs, prob = 0.99, na.rm = T),
+                top = ifelse(avg.obs > quan.obs, 1, 0)) %>%
+  dplyr::select(id, top) %>% distinct()
+
+plot <- bind_rows(all.train.pred %>% mutate(Set="Train"),
+                  all.test.pred %>% mutate(Set="Test")) %>% 
+  filter(spl.id==3) %>% 
+  left_join(., temp) %>% filter(top==1) %>% 
+  mutate(ln.prob.nm.flow=exp(ln.prob.nm.flow)*100,
+         .sim = exp(.sim)*100)
+# summary(plot$.sim)
+
+pacman::p_load(scales)
+ggplot(plot, aes(x=Year, y=ln.prob.nm.flow, group=c(Mod))) +
+  geom_point(#aes(color=iso3.Origin), 
+             color="grey20", show.legend = F, shape=1) +
+  geom_line(aes(y=.sim, color=Mod, linetype=Mod), 
+            alpha=0.8, show.legend = T) +
+    scale_color_viridis_d() +
+    scale_fill_viridis_d() +
+  facet_wrap(. ~ id, ncol=2, scales = "free_y") +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  ylab("Asyl. Seek. Rate (per 100 Origin Pop.)") +
+  theme_minimal() +
+  theme(legend.title = element_blank(), legend.position = "bottom")
+ggsave(paste(study.title, "predTrends.jpeg"), height=6, width=5)
+
+```
+
+
